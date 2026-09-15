@@ -21,6 +21,7 @@ class IngestTests(unittest.TestCase):
         out = parse_rss(xml)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["source"]["url"], "https://example.org/incidents/abc")
+        self.assertEqual(out[0]["observed_at"], "2026-01-01T12:00:00+00:00")
 
     def test_json_source_object_is_normalized(self):
         payload = '''[{"id":"x1","title":"Flood","source":{"name":"Agency","source_id":"upstream-1","url":"https://example.org/x1"}}]'''
@@ -28,6 +29,22 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(out[0]["source"]["name"], "Agency")
         self.assertEqual(out[0]["source"]["source_id"], "upstream-1")
         self.assertEqual(out[0]["source"]["url"], "https://example.org/x1")
+
+    def test_missing_or_invalid_timestamp_is_not_fabricated(self):
+        missing = parse_json('[{"id":"x1","title":"Flood"}]')[0]
+        invalid = parse_json('[{"id":"x2","title":"Flood","observed_at":"not-a-date"}]')[0]
+        self.assertIsNone(missing["observed_at"])
+        self.assertIsNone(invalid["observed_at"])
+        self.assertEqual(invalid["raw"]["input_timestamp"], "not-a-date")
+
+    def test_cap_invalid_expiry_is_not_replaced_with_now(self):
+        xml = '''<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>cap1</identifier><sender>agency@example.org</sender><sent>2026-01-01T12:00:00Z</sent><status>Actual</status>
+          <info><event>Flood</event><headline>Flood warning</headline><severity>Severe</severity><expires>invalid</expires></info>
+        </alert>'''
+        out = parse_cap(xml)
+        self.assertEqual(out[0]["observed_at"], "2026-01-01T12:00:00+00:00")
+        self.assertIsNone(out[0]["expires_at"])
 
     def test_unsafe_source_url_is_dropped(self):
         out = parse_json('[{"title":"Flood","source":{"name":"Agency","url":"javascript:alert(1)"}}]')
