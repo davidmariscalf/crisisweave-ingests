@@ -30,10 +30,18 @@ def _bounded(value: Any, limit: int, default: str = "") -> str:
     return text[:limit]
 
 
-def _iso(value: str | None) -> str:
+def _iso(value: str | None) -> str | None:
+    """Normalize a trustworthy timestamp, or preserve uncertainty as None.
+
+    Crisis information must not become artificially recent because a source
+    omitted or malformed its timestamp. Downstream verification already treats
+    a missing time as unknown, which is safer than inventing the current time.
+    """
     if not value:
-        return datetime.now(timezone.utc).isoformat()
+        return None
     value = value.strip()
+    if not value:
+        return None
     try:
         if value.endswith("Z"):
             parsed = datetime.fromisoformat(value[:-1] + "+00:00")
@@ -43,7 +51,7 @@ def _iso(value: str | None) -> str:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc).isoformat()
     except ValueError:
-        return datetime.now(timezone.utc).isoformat()
+        return None
 
 
 def _stable_id(*parts: str) -> str:
