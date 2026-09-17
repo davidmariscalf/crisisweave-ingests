@@ -19,6 +19,12 @@ MAX_AREA = 1000
 MAX_SOURCE_NAME = 300
 MAX_SOURCE_ID = 512
 MAX_URL = 2048
+MAX_CAP_SHAPES = 256
+MAX_CAP_POINTS_PER_SHAPE = 5000
+MAX_CAP_GEOCODES = 256
+CAP_CIRCLE_SEGMENTS = 64
+EARTH_RADIUS_KM = 6371.0088
+MAX_CAP_CIRCLE_RADIUS_KM = 20_000.0
 
 
 def _text(node: ET.Element | None) -> str:
@@ -145,6 +151,149 @@ def _point(value: Any) -> dict[str, Any] | None:
     return {"type": "Point", "coordinates": [lon, lat]}
 
 
+def _cap_position(value: str) -> tuple[float, float] | None:
+    """Parse a CAP latitude,longitude pair and validate both axes."""
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        return None
+    if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        return None
+    return lat, lon
+
+
+def _cap_polygon(value: str) -> list[list[float]] | None:
+    """Convert a CAP polygon into a closed GeoJSON exterior ring.
+
+    CAP coordinates are latitude,longitude; GeoJSON coordinates are
+    longitude,latitude. A malformed polygon is rejected as a unit so that a
+    partial shape is never presented as authoritative geometry.
+    """
+    tokens = value.split()
+    if len(tokens) < 3 or len(tokens) > MAX_CAP_POINTS_PER_SHAPE:
+        return None
+    ring: list[list[float]] = []
+    for token in tokens:
+        position = _cap_position(token)
+        if position is None:
+            return None
+        lat, lon = position
+        ring.append([lon, lat])
+    if len({(point[0], point[1]) for point in ring}) < 3:
+        return None
+    if ring[0] != ring[-1]:
+        ring.append(ring[0].copy())
+    if len(ring) < 4:
+        return None
+    return ring
+
+
+def _cap_circle(value: str) -> list[list[float]] | None:
+    """Approximate a CAP latitude,longitude radius-km circle as GeoJSON."""
+    parts = value.split()
+    if len(parts) != 2:
+        return None
+    center = _cap_position(parts[0])
+    if center is None:
+        return None
+    try:
+        radius_km = float(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(radius_km) or not 0 < radius_km <= MAX_CAP_CIRCLE_RADIUS_KM:
+        return None
+
+    lat_deg, lon_deg = center
+    lat1 = math.radians(lat_deg)
+    lon1 = math.radians(lon_deg)
+    angular = radius_km / EARTH_RADIUS_KM
+    ring: list[list[float]] = []
+    for idx in range(CAP_CIRCLE_SEGMENTS):
+        bearing = 2 * math.pi * idx / CAP_CIRCLE_SEGMENTS
+        lat2 = math.asin(
+            math.sin(lat1) * math.cos(angular)
+            + math.cos(lat1) * math.sin(angular) * math.cos(bearing)
+        )
+        lon2 = lon1 + math.atan2(
+            math.sin(bearing) * math.sin(angular) * math.cos(lat1),
+            math.cos(angular) - math.sin(lat1) * math.sin(lat2),
+        )
+        lon = ((math.degrees(lon2) + 540.0) % 360.0) - 180.0
+        ring.append([lon, math.degrees(lat2)])
+    ring.append(ring[0].copy())
+    return ring
+
+
+def _cap_area_data(info: ET.Element, ns: str) -> tuple[dict[str, Any] | None, str | None, list[dict[str, Any]]]:
+    """Return normalized geometry, display area and bounded raw CAP areas.
+
+    Multiple CAP areas and shapes are kept in document order. Invalid polygon
+    or circle strings remain visible in ``raw`` but are omitted from normalized
+    geometry, so one bad shape cannot drop the full alert. ``areaDesc`` and
+    geocodes are preserved as provenance only; they are never silently
+    geocoded.
+    """
+    rings: list[list[list[float]]] = []
+    descriptions: list[str] = []
+    raw_areas: list[dict[str, Any]] = []
+    shape_count = 0
+
+    for area_node in info.findall(f"{ns}area"):
+        description = _bounded(_text(area_node.find(f"{ns}areaDesc")), MAX_AREA)
+        if description and description not in descriptions:
+            descriptions.append(description)
+        raw_area: dict[str, Any] = {
+            "areaDesc": description or None,
+            "polygon": [],
+            "circle": [],
+            "geocode": [],
+        }
+
+        for polygon_node in area_node.findall(f"{ns}polygon"):
+            raw_value = _text(polygon_node)
+            if raw_value:
+                raw_area["polygon"].append(_bounded(raw_value, MAX_DESCRIPTION))
+            if shape_count >= MAX_CAP_SHAPES:
+                continue
+            shape_count += 1
+            ring = _cap_polygon(raw_value)
+            if ring is not None:
+                rings.append(ring)
+
+        for circle_node in area_node.findall(f"{ns}circle"):
+            raw_value = _text(circle_node)
+            if raw_value:
+                raw_area["circle"].append(_bounded(raw_value, MAX_DESCRIPTION))
+            if shape_count >= MAX_CAP_SHAPES:
+                continue
+            shape_count += 1
+            ring = _cap_circle(raw_value)
+            if ring is not None:
+                rings.append(ring)
+
+        for geocode_node in area_node.findall(f"{ns}geocode")[:MAX_CAP_GEOCODES]:
+            value_name = _bounded(_text(geocode_node.find(f"{ns}valueName")), 256)
+            value = _bounded(_text(geocode_node.find(f"{ns}value")), 1024)
+            if value_name or value:
+                raw_area["geocode"].append({"valueName": value_name or None, "value": value or None})
+
+        raw_areas.append(raw_area)
+
+    geometry: dict[str, Any] | None = None
+    if len(rings) == 1:
+        geometry = {"type": "Polygon", "coordinates": [rings[0]]}
+    elif len(rings) > 1:
+        geometry = {"type": "MultiPolygon", "coordinates": [[[point for point in ring]] for ring in rings]}
+
+    area_text = _bounded("; ".join(descriptions), MAX_AREA) or None
+    return geometry, area_text, raw_areas
+
+
 def _limit_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(events) > MAX_EVENTS:
         raise ValueError(f"feed exceeds {MAX_EVENTS} events")
@@ -185,8 +334,7 @@ def parse_cap(xml_text: str, source_url: str | None = None) -> list[dict[str, An
         severity = _text(info.find(f"{ns}severity"))
         effective = _text(info.find(f"{ns}effective")) or sent
         expires = _text(info.find(f"{ns}expires")) or None
-        area_node = info.find(f"{ns}area")
-        area = _bounded(_text(area_node.find(f"{ns}areaDesc")) if area_node is not None else "", MAX_AREA)
+        geometry, area, raw_areas = _cap_area_data(info, ns)
         event_id = identifier or _stable_id(sender, event_name, effective, str(idx))
 
         events.append(
@@ -200,8 +348,8 @@ def parse_cap(xml_text: str, source_url: str | None = None) -> list[dict[str, An
                 "severity": _severity(severity),
                 "confidence": 0.9 if status.casefold() == "actual" else 0.75,
                 "official": True,
-                "geometry": None,
-                "area": area or None,
+                "geometry": geometry,
+                "area": area,
                 "source": {
                     "name": sender,
                     "type": "cap",
@@ -213,6 +361,7 @@ def parse_cap(xml_text: str, source_url: str | None = None) -> list[dict[str, An
                     "status": _bounded(status, 64),
                     "severity": _bounded(severity, 64),
                     "event": event_name,
+                    "areas": raw_areas,
                 },
                 "tags": ["cap"],
             }

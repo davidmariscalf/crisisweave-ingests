@@ -46,6 +46,70 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(out[0]["observed_at"], "2026-01-01T12:00:00+00:00")
         self.assertIsNone(out[0]["expires_at"])
 
+    def test_cap_polygon_becomes_geojson_and_preserves_raw_area(self):
+        xml = '''<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>cap-poly</identifier><sender>agency@example.org</sender><sent>2026-01-01T12:00:00Z</sent><status>Actual</status>
+          <info><event>Flood</event><headline>Flood polygon</headline><severity>Severe</severity>
+            <area><areaDesc>River district</areaDesc><polygon>40.0,-3.0 40.2,-3.0 40.2,-2.8</polygon></area>
+          </info>
+        </alert>'''
+        event = parse_cap(xml)[0]
+        self.assertEqual(event["area"], "River district")
+        self.assertEqual(event["geometry"]["type"], "Polygon")
+        ring = event["geometry"]["coordinates"][0]
+        self.assertEqual(ring[0], [-3.0, 40.0])
+        self.assertEqual(ring[0], ring[-1])
+        self.assertEqual(event["raw"]["areas"][0]["polygon"][0], "40.0,-3.0 40.2,-3.0 40.2,-2.8")
+
+    def test_cap_circle_becomes_closed_polygon(self):
+        xml = '''<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>cap-circle</identifier><sender>agency@example.org</sender><sent>2026-01-01T12:00:00Z</sent><status>Actual</status>
+          <info><event>Wildfire</event><headline>Evacuation radius</headline><severity>Extreme</severity>
+            <area><areaDesc>Evacuation zone</areaDesc><circle>40.0,-3.0 10</circle></area>
+          </info>
+        </alert>'''
+        event = parse_cap(xml)[0]
+        self.assertEqual(event["geometry"]["type"], "Polygon")
+        ring = event["geometry"]["coordinates"][0]
+        self.assertEqual(len(ring), 65)
+        self.assertEqual(ring[0], ring[-1])
+        self.assertTrue(all(-180 <= point[0] <= 180 and -90 <= point[1] <= 90 for point in ring))
+
+    def test_cap_multiple_areas_are_deterministic_multipolygon(self):
+        xml = '''<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>cap-multi</identifier><sender>agency@example.org</sender><sent>2026-01-01T12:00:00Z</sent><status>Actual</status>
+          <info><event>Storm</event><headline>Two warning zones</headline><severity>Moderate</severity>
+            <area><areaDesc>Zone A</areaDesc><polygon>40,-3 40.1,-3 40.1,-2.9</polygon></area>
+            <area><areaDesc>Zone B</areaDesc><polygon>41,-4 41.1,-4 41.1,-3.9</polygon><geocode><valueName>SAME</valueName><value>001</value></geocode></area>
+          </info>
+        </alert>'''
+        event = parse_cap(xml)[0]
+        self.assertEqual(event["area"], "Zone A; Zone B")
+        self.assertEqual(event["geometry"]["type"], "MultiPolygon")
+        self.assertEqual(len(event["geometry"]["coordinates"]), 2)
+        self.assertEqual(event["geometry"]["coordinates"][0][0][0], [-3.0, 40.0])
+        self.assertEqual(event["geometry"]["coordinates"][1][0][0], [-4.0, 41.0])
+        self.assertEqual(event["raw"]["areas"][1]["geocode"], [{"valueName": "SAME", "value": "001"}])
+
+    def test_cap_malformed_shape_is_rejected_without_dropping_alert(self):
+        xml = '''<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>cap-bad</identifier><sender>agency@example.org</sender><sent>2026-01-01T12:00:00Z</sent><status>Actual</status>
+          <info><event>Flood</event><headline>Mixed geometry</headline><severity>Severe</severity>
+            <area><areaDesc>Known area</areaDesc>
+              <polygon>999,-3 40,-3 40,-2</polygon>
+              <circle>40,-3 not-a-radius</circle>
+              <geocode><valueName>UGC</valueName><value>ABC123</value></geocode>
+            </area>
+          </info>
+        </alert>'''
+        event = parse_cap(xml)[0]
+        self.assertEqual(event["id"], "cap-bad")
+        self.assertEqual(event["area"], "Known area")
+        self.assertIsNone(event["geometry"])
+        self.assertEqual(event["raw"]["areas"][0]["polygon"], ["999,-3 40,-3 40,-2"])
+        self.assertEqual(event["raw"]["areas"][0]["circle"], ["40,-3 not-a-radius"])
+        self.assertEqual(event["raw"]["areas"][0]["geocode"][0]["value"], "ABC123")
+
     def test_unsafe_source_url_is_dropped(self):
         out = parse_json('[{"title":"Flood","source":{"name":"Agency","url":"javascript:alert(1)"}}]')
         self.assertIsNone(out[0]["source"]["url"])
