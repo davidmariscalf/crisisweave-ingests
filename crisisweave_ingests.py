@@ -335,7 +335,11 @@ def parse_cap(xml_text: str, source_url: str | None = None) -> list[dict[str, An
         effective = _text(info.find(f"{ns}effective")) or sent
         expires = _text(info.find(f"{ns}expires")) or None
         geometry, area, raw_areas = _cap_area_data(info, ns)
-        event_id = identifier or _stable_id(sender, event_name, effective, str(idx))
+        if identifier and len(infos) == 1:
+            event_id = identifier
+        else:
+            event_id = _stable_id(identifier or sender, event_name, effective, str(idx))
+        source_id = identifier or event_id
 
         events.append(
             {
@@ -354,7 +358,7 @@ def parse_cap(xml_text: str, source_url: str | None = None) -> list[dict[str, An
                     "name": sender,
                     "type": "cap",
                     "url": safe_source_url,
-                    "source_id": event_id,
+                    "source_id": source_id,
                 },
                 "evidence": [{"source": sender, "weight": 0.9, "note": "CAP alert"}],
                 "raw": {
