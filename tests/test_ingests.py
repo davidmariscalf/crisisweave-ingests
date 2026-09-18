@@ -46,6 +46,17 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(out[0]["observed_at"], "2026-01-01T12:00:00+00:00")
         self.assertIsNone(out[0]["expires_at"])
 
+    def test_cap_multi_info_events_get_unique_ids_but_keep_message_source_id(self):
+        xml = '''<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>shared-cap-id</identifier><sender>agency@example.org</sender><sent>2026-01-01T12:00:00Z</sent><status>Actual</status>
+          <info><event>Flood</event><headline>Flood warning</headline><severity>Severe</severity></info>
+          <info><event>Storm</event><headline>Storm warning</headline><severity>Moderate</severity></info>
+        </alert>'''
+        events = parse_cap(xml)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(len({event["id"] for event in events}), 2)
+        self.assertTrue(all(event["source"]["source_id"] == "shared-cap-id" for event in events))
+
     def test_cap_polygon_becomes_geojson_and_preserves_raw_area(self):
         xml = '''<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
           <identifier>cap-poly</identifier><sender>agency@example.org</sender><sent>2026-01-01T12:00:00Z</sent><status>Actual</status>
